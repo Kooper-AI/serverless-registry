@@ -690,8 +690,11 @@ export class R2Registry implements Registry {
     };
   }
 
-  async getLayer(name: string, digest: string): Promise<RegistryError | GetLayerResponse> {
-    const [res, err] = await wrap(this.env.REGISTRY.get(`${name}/blobs/${digest}`));
+  async getLayer(name: string, digest: string, rangeHeader?: string): Promise<RegistryError | GetLayerResponse> {
+    // R2 natively supports ranged reads when handed the raw Range header.
+    const options: R2GetOptions | undefined =
+      rangeHeader !== undefined ? { range: new Headers({ range: rangeHeader }) } : undefined;
+    const [res, err] = await wrap(this.env.REGISTRY.get(`${name}/blobs/${digest}`, options));
     if (err) {
       return wrapError("getLayer", err);
     }
@@ -704,7 +707,24 @@ export class R2Registry implements Registry {
 
     // Handle R2 symlink
     if (res.customMetadata && symlinkHeader in res.customMetadata) {
-      const layerPath = await res.text();
+      // Symlink objects are tiny path strings — a ranged read would slice
+      // the link text itself, so re-read the whole link object before
+      // resolving, then apply the range to the TARGET layer.
+      let linkObject: R2ObjectBody = res;
+      if (rangeHeader !== undefined) {
+        res.body?.cancel().catch(() => {});
+        const [full, err2] = await wrap(this.env.REGISTRY.get(`${name}/blobs/${digest}`));
+        if (err2) {
+          return wrapError("getLayer", err2);
+        }
+        if (!full) {
+          return {
+            response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
+          };
+        }
+        linkObject = full;
+      }
+      const layerPath = await linkObject.text();
       // Symlink detected! Will download layer from "layerPath"
       const [linkName, linkDigest] = layerPath.split("/blobs/");
       if (linkName == name && linkDigest == digest) {
@@ -712,7 +732,29 @@ export class R2Registry implements Registry {
           response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
         };
       }
-      return await this.env.REGISTRY_CLIENT.getLayer(linkName, linkDigest);
+      return await this.env.REGISTRY_CLIENT.getLayer(linkName, linkDigest, rangeHeader);
+    }
+
+    // Only report a partial read when the caller actually sent a Range
+    // header (some R2 implementations populate res.range on full reads
+    // too); res.size is always the FULL object size, which is what
+    // Content-Range's total needs.
+    if (rangeHeader !== undefined && res.range !== undefined) {
+      const offset =
+        "offset" in res.range && res.range.offset !== undefined
+          ? res.range.offset
+          : "suffix" in res.range && res.range.suffix !== undefined
+            ? res.size - res.range.suffix
+            : 0;
+      const length =
+        "length" in res.range && res.range.length !== undefined ? res.range.length : res.size - offset;
+      return {
+        stream: res.body!,
+        digest: hexToDigest(res.checksums.sha256!),
+        size: length,
+        range: { offset, length },
+        totalSize: res.size,
+      };
     }
 
     return {

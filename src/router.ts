@@ -360,12 +360,28 @@ v2Router.get("/:name+/referrers/:digest", async (req, env: Env) => {
 
 v2Router.get("/:name+/blobs/:digest", async (req, env: Env, context: ExecutionContext) => {
   const { name, digest } = req.params;
-  const res = await env.REGISTRY_CLIENT.getLayer(name, digest);
+  // containerd resumes and parallelizes large-layer pulls with byte-range
+  // requests and requires a 206 answer — replying 200 to a ranged request
+  // breaks pulls on containerd hosts (e.g. RunPod; upstream issue #64).
+  const rangeHeader = req.headers.get("Range") ?? undefined;
+  const res = await env.REGISTRY_CLIENT.getLayer(name, digest, rangeHeader);
   if (!("response" in res)) {
+    if (res.range !== undefined && res.totalSize !== undefined) {
+      return new Response(res.stream, {
+        status: 206,
+        headers: {
+          "Docker-Content-Digest": res.digest,
+          "Content-Length": `${res.range.length}`,
+          "Content-Range": `bytes ${res.range.offset}-${res.range.offset + res.range.length - 1}/${res.totalSize}`,
+          "Accept-Ranges": "bytes",
+        },
+      });
+    }
     return new Response(res.stream, {
       headers: {
         "Docker-Content-Digest": res.digest,
         "Content-Length": `${res.size}`,
+        "Accept-Ranges": "bytes",
       },
     });
   }

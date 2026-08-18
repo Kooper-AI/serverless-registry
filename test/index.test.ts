@@ -146,6 +146,41 @@ describe("v2", () => {
     expect(response.status).toBe(200);
   });
 
+  test("blob GET honors HTTP Range requests with 206 + Content-Range", async () => {
+    // containerd resumes/parallelizes large-layer pulls with byte ranges
+    // and requires a 206 — a 200 answer to a ranged request breaks pulls
+    // on containerd hosts (issue #64).
+    const name = "range-blob";
+    const content = "0123456789abcdef"; // 16 bytes
+    const digest = await getSHA256(content);
+    const upload = await fetch(createRequest("POST", `/v2/${name}/blobs/uploads/`, null, {}));
+    expect(upload.ok).toBeTruthy();
+    const stream = limit(new Blob([content]).stream(), content.length);
+    const patch = await fetch(createRequest("PATCH", upload.headers.get("location")!, stream, {}));
+    expect(patch.ok).toBeTruthy();
+    const put = await fetch(createRequest("PUT", patch.headers.get("location")! + "&digest=" + digest, null, {}));
+    expect(put.ok).toBeTruthy();
+
+    // Full read stays a 200 and now advertises range support
+    const full = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null));
+    expect(full.status).toBe(200);
+    expect(full.headers.get("Accept-Ranges")).toBe("bytes");
+    expect(await full.text()).toBe(content);
+
+    // Bounded range
+    const mid = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: "bytes=4-9" }));
+    expect(mid.status).toBe(206);
+    expect(mid.headers.get("Content-Range")).toBe("bytes 4-9/16");
+    expect(mid.headers.get("Content-Length")).toBe("6");
+    expect(await mid.text()).toBe("456789");
+
+    // Open-ended range (the resume shape containerd sends)
+    const tail = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: "bytes=10-" }));
+    expect(tail.status).toBe(206);
+    expect(tail.headers.get("Content-Range")).toBe("bytes 10-15/16");
+    expect(await tail.text()).toBe("abcdef");
+  });
+
   test("Username password authenticatiom fails gracefully when wrong format", async () => {
     const res = await fetchUnauth(
       createRequest("GET", `/v2/`, null, {

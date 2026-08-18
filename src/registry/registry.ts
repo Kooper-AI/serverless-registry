@@ -104,6 +104,11 @@ export type GetLayerResponse = {
   stream: ReadableStream;
   digest: string;
   size: number;
+  // Set when the layer was read with an HTTP Range header: the byte window
+  // this stream covers and the full blob size, so the router can answer
+  // with 206 + Content-Range (containerd requires this for large layers).
+  range?: { offset: number; length: number };
+  totalSize?: number;
 };
 
 export type ReferrerDescriptor = {
@@ -149,8 +154,9 @@ export interface Registry {
   // checks that a layer exists
   layerExists(namespace: string, digest: string): Promise<CheckLayerResponse | RegistryError>;
 
-  // get a layer stream from the registry
-  getLayer(namespace: string, digest: string): Promise<GetLayerResponse | RegistryError>;
+  // get a layer stream from the registry; rangeHeader is an optional raw
+  // HTTP Range header value ("bytes=start-end") for partial reads
+  getLayer(namespace: string, digest: string, rangeHeader?: string): Promise<GetLayerResponse | RegistryError>;
 
   // list referrers for a subject digest
   listReferrers(
