@@ -53,14 +53,14 @@ export async function hash(readableStream: ReadableStream | null, state?: Uint8A
     hasher = hasher.init();
   }
 
-  const reader = readableStream?.getReader({ mode: "byob" });
-  while (reader !== undefined) {
-    // 5 MB reads: the other side of a tee is written as this side reads, and
-    // the runtime buffers whatever this side leaves unread.
-    const array = new Uint8Array(1024 * 1024 * 5);
-    const value = await reader.read(array);
-    if (value.done) break;
-    hasher.update(value.value);
+  // Each chunk the stream yields is hashed as it comes, with nothing
+  // allocated per read: a tee'd request body arrives in thousands of small
+  // reads per 45 MB chunk, and a buffer allocated for each costs more CPU
+  // than the hashing (a Worker's CPU limit was reached that way).
+  if (readableStream !== null) {
+    for await (const chunk of readableStream as unknown as AsyncIterable<Uint8Array>) {
+      hasher.update(chunk);
+    }
   }
 
   return hasher;

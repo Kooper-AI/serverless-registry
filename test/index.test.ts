@@ -434,6 +434,29 @@ describe("blobs pushed in chunks", () => {
     expect(new Uint8Array(await ranged.arrayBuffer())).toEqual(chunks[1].subarray(0, 16));
   });
 
+  test("hashing a 45 MB chunk as it is stored costs well under a Worker's CPU limit", async () => {
+    // regctl pushes 45 MB chunks (push-image.sh --blob-chunk); a Worker has
+    // 30 s of CPU per request. Wall time here bounds the CPU the hashing
+    // and the storing take together in the runtime.
+    const name = "chunked-cost";
+    const chunk = randomChunk(45_000_000);
+    const digest = await digestOf([chunk]);
+    const upload = await fetch(createRequest("POST", `/v2/${name}/blobs/uploads/`, null, {}));
+    const started = Date.now();
+    const patch = await fetch(
+      createRequest("PATCH", upload.headers.get("location")!, limit(new Blob([chunk]).stream(), chunk.length), {
+        "Content-Length": `${chunk.length}`,
+        "Content-Range": `0-${chunk.length - 1}`,
+      }),
+    );
+    const took = Date.now() - started;
+    expect(patch.status).toBe(202);
+    expect(took).toBeLessThan(3000);
+    const put = await fetch(createRequest("PUT", patch.headers.get("location")! + "&digest=" + digest, null, {}));
+    expect(put.status).toBe(201);
+    console.log(`a 45 MB chunk stored and hashed in ${took} ms`);
+  });
+
   test("a push whose final digest is not the bytes' is refused and leaves nothing", async () => {
     const name = "chunked-wrong";
     const chunks = [randomChunk(chunkBytes), randomChunk(chunkBytes)];
