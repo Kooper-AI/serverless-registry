@@ -11,5 +11,5 @@
     "strict": true,
     "strictNullChecks": true
   },
-  "include": ["./**/*.ts", "./*.ts"]
+  "include": ["./**/*.ts", "./*.ts", "../src/hash-wasm.d.ts"]
 }

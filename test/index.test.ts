@@ -8,7 +8,8 @@ import { registries } from "../src/registry/registry";
 import type { ReferrerDescriptor } from "../src/registry/registry";
 import { isDockerDotIO, RegistryHTTPClient } from "../src/registry/http";
 import { ManifestSchema } from "../src/manifest";
-import { limit } from "../src/chunk";
+import { limit, MINIMUM_CHUNK } from "../src/chunk";
+import { digestHeaderInReference, referenceHeader } from "../src/registry/r2";
 import worker from "../index";
 import { env } from "cloudflare:workers";
 import { createExecutionContext, reset, waitOnExecutionContext } from "cloudflare:test";
@@ -344,6 +345,132 @@ async function seedReferrerIndex(name: string, subjectDigest: string, descriptor
     );
   }
 }
+
+// A blob pushed in chunks is hashed as its chunks arrive and served from the
+// object its multipart upload produced, through a reference at its path: no
+// copy of its bytes, so its size is bounded by R2's multipart limits and not
+// by the single-request upload size a copy would be (cloudflare/serverless-registry#69).
+describe("blobs pushed in chunks", () => {
+  const chunkBytes = MINIMUM_CHUNK;
+  function randomChunk(size: number): Uint8Array {
+    const bytes = new Uint8Array(size);
+    for (let offset = 0; offset < size; offset += 65536) {
+      crypto.getRandomValues(bytes.subarray(offset, Math.min(offset + 65536, size)));
+    }
+    return bytes;
+  }
+  async function digestOf(chunks: Uint8Array[]): Promise<string> {
+    const whole = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+    let offset = 0;
+    for (const c of chunks) {
+      whole.set(c, offset);
+      offset += c.length;
+    }
+    return (
+      "sha256:" +
+      [...new Uint8Array(await crypto.subtle.digest("SHA-256", whole))]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("")
+    );
+  }
+  async function pushChunks(name: string, chunks: Uint8Array[]): Promise<string> {
+    const upload = await fetch(createRequest("POST", `/v2/${name}/blobs/uploads/`, null, {}));
+    expect(upload.ok).toBeTruthy();
+    let location = upload.headers.get("location")!;
+    let start = 0;
+    for (const chunk of chunks) {
+      const patch = await fetch(
+        createRequest("PATCH", location, limit(new Blob([chunk]).stream(), chunk.length), {
+          "Content-Length": `${chunk.length}`,
+          "Content-Range": `${start}-${start + chunk.length - 1}`,
+        }),
+      );
+      expect(patch.status).toBe(202);
+      location = patch.headers.get("location")!;
+      start += chunk.length;
+    }
+    return location;
+  }
+
+  test("a blob pushed in three chunks is served, whole and by range, from a reference to its upload", async () => {
+    const name = "chunked";
+    const chunks = [randomChunk(chunkBytes), randomChunk(chunkBytes), randomChunk(chunkBytes - 7)];
+    const digest = await digestOf(chunks);
+    const location = await pushChunks(name, chunks);
+    const put = await fetch(createRequest("PUT", location + "&digest=" + digest, null, {}));
+    expect(put.status).toBe(201);
+    expect(put.headers.get("Docker-Content-Digest")).toBe(digest);
+
+    // Stored as a reference: the blob's object names the upload's object,
+    // which holds the bytes, and carries the digest verified at the push.
+    const bindings = env as Env;
+    const reference = await bindings.REGISTRY.get(`${name}/blobs/${digest}`);
+    expect(reference).not.toBeNull();
+    const underlyingKey = reference!.customMetadata![referenceHeader];
+    expect(underlyingKey).toBeDefined();
+    expect(reference!.customMetadata![digestHeaderInReference]).toBe(digest);
+    expect(await reference!.text()).toBe(underlyingKey);
+    const underlying = await bindings.REGISTRY.head(underlyingKey);
+    expect(underlying!.size).toBe(chunkBytes * 3 - 7);
+    expect((await bindings.REGISTRY.list({ prefix: `${name}/uploads/` })).objects.length).toBe(0);
+
+    const head = await fetch(createRequest("HEAD", `/v2/${name}/blobs/${digest}`, null));
+    expect(head.status).toBe(200);
+    expect(head.headers.get("Content-Length")).toBe(`${chunkBytes * 3 - 7}`);
+    expect(head.headers.get("Docker-Content-Digest")).toBe(digest);
+
+    const whole = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null));
+    expect(whole.status).toBe(200);
+    const body = new Uint8Array(await whole.arrayBuffer());
+    expect(body.length).toBe(chunkBytes * 3 - 7);
+    expect(body.subarray(0, 32)).toEqual(chunks[0].subarray(0, 32));
+    expect(body.subarray(chunkBytes * 2, chunkBytes * 2 + 32)).toEqual(chunks[2].subarray(0, 32));
+
+    const ranged = await fetch(
+      createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: `bytes=${chunkBytes}-${chunkBytes + 15}` }),
+    );
+    expect(ranged.status).toBe(206);
+    expect(ranged.headers.get("Content-Range")).toBe(`bytes ${chunkBytes}-${chunkBytes + 15}/${chunkBytes * 3 - 7}`);
+    expect(new Uint8Array(await ranged.arrayBuffer())).toEqual(chunks[1].subarray(0, 16));
+  });
+
+  test("a push whose final digest is not the bytes' is refused and leaves nothing", async () => {
+    const name = "chunked-wrong";
+    const chunks = [randomChunk(chunkBytes), randomChunk(chunkBytes)];
+    const digest = await digestOf(chunks);
+    const claimed = "sha256:" + "0".repeat(63) + "1";
+    const location = await pushChunks(name, chunks);
+    const put = await fetch(createRequest("PUT", location + "&digest=" + claimed, null, {}));
+    expect(put.status).toBe(400);
+    const body = (await put.json()) as { errors: { code: string; detail: { Expected: string; Got: string } }[] };
+    expect(body.errors[0].code).toBe("DIGEST_INVALID");
+    expect(body.errors[0].detail).toEqual({ Expected: claimed, Got: digest });
+
+    const bindings = env as Env;
+    expect(await bindings.REGISTRY.head(`${name}/blobs/${claimed}`)).toBeNull();
+    expect(await bindings.REGISTRY.head(`${name}/blobs/${digest}`)).toBeNull();
+    expect((await bindings.REGISTRY.list({ prefix: `${name}/uploads/` })).objects.length).toBe(0);
+    const head = await fetch(createRequest("HEAD", `/v2/${name}/blobs/${claimed}`, null));
+    expect(head.status).toBe(404);
+  });
+
+  test("garbage collection of an unreferenced blob removes the object its reference names", async () => {
+    const name = "chunked-gc";
+    const chunks = [randomChunk(chunkBytes), randomChunk(chunkBytes)];
+    const digest = await digestOf(chunks);
+    const location = await pushChunks(name, chunks);
+    const put = await fetch(createRequest("PUT", location + "&digest=" + digest, null, {}));
+    expect(put.status).toBe(201);
+    const bindings = env as Env;
+    const underlyingKey = (await bindings.REGISTRY.head(`${name}/blobs/${digest}`))!.customMetadata![referenceHeader];
+    expect(await bindings.REGISTRY.head(underlyingKey)).not.toBeNull();
+
+    await runGarbageCollector(name, "unreferenced");
+
+    expect(await bindings.REGISTRY.head(`${name}/blobs/${digest}`)).toBeNull();
+    expect(await bindings.REGISTRY.head(underlyingKey)).toBeNull();
+  });
+});
 
 describe("v2 manifests", () => {
   test("HEAD /v2/:name/manifests/:reference NOT FOUND", async () => {

@@ -1,3 +1,4 @@
+import { createSHA256, IHasher, loadWasm } from "@taylorzane/hash-wasm";
 import { Env } from "../..";
 import jwt from "@tsndr/cloudflare-worker-jwt";
 import {
@@ -11,7 +12,7 @@ import {
 } from "../chunk";
 import { InternalError, ManifestError, RangeError, ServerError } from "../errors";
 import { SHA256_PREFIX_LEN, getSHA256, hexToDigest, isValidDigest } from "../user";
-import { readableToBlob, readerToBlob, wrap } from "../utils";
+import { errorString, readableToBlob, readerToBlob, wrap } from "../utils";
 import { BlobUnknownError, ManifestUnknownError } from "../v2-errors";
 import {
   CheckLayerResponse,
@@ -31,6 +32,101 @@ import {
 } from "./registry";
 import { GarbageCollectionMode, GarbageCollector } from "./garbage-collector";
 import { ManifestSchema, manifestSchema } from "../manifest";
+import { DigestInvalid, RegistryResponseJSON } from "../v2-responses";
+import sha256Wasm from "@taylorzane/hash-wasm/wasm/sha256.wasm";
+
+// A blob's SHA-256 is computed while its chunks arrive, never afterwards: an
+// upload's hash state (hash-wasm's, saved and resumed) travels in the
+// upload's signed state between requests, so at the final request the digest
+// is already known. The blob is then served from the object the multipart
+// upload produced, through a reference object at the blob's path (custom
+// metadata: the underlying key and the verified digest); no copy of the
+// blob's bytes is ever made, so a blob is bounded by R2's multipart limits,
+// not by the single-request upload size (4.995 GiB) a copy through the
+// Worker would be.
+export async function hash(readableStream: ReadableStream | null, state?: Uint8Array): Promise<IHasher> {
+  loadWasm({ sha256: sha256Wasm });
+  let hasher = await createSHA256();
+  if (state !== undefined) {
+    hasher.load(state);
+  } else {
+    hasher = hasher.init();
+  }
+
+  const reader = readableStream?.getReader({ mode: "byob" });
+  while (reader !== undefined) {
+    // 5 MB reads: the other side of a tee is written as this side reads, and
+    // the runtime buffers whatever this side leaves unread.
+    const array = new Uint8Array(1024 * 1024 * 5);
+    const value = await reader.read(array);
+    if (value.done) break;
+    hasher.update(value.value);
+  }
+
+  return hasher;
+}
+
+export function hashStateFromBase64(hashState: string): Uint8Array {
+  return Uint8Array.from(atob(hashState), (c) => c.charCodeAt(0));
+}
+
+export function hashStateToBase64(array: Uint8Array): string {
+  let binary = "";
+  for (const byte of array) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+// A blob stored as a reference: the object at <name>/blobs/<digest> carries
+// the key of the object holding the bytes and the digest verified for it.
+export const referenceHeader = "X-Serverless-Registry-Reference";
+export const digestHeaderInReference = "X-Serverless-Registry-Digest";
+export const registryUploadKey = "X-Serverless-Registry-Upload";
+
+export function isReference(r2Object: R2Object): false | string {
+  if (r2Object.customMetadata === undefined) return false;
+  const value = r2Object.customMetadata[referenceHeader];
+  if (value !== undefined) {
+    return value;
+  }
+  return false;
+}
+
+// The digest a reference object was written with: verified when the blob
+// finished uploading.
+export function referencedDigest(r2Object: R2Object): string {
+  const digest = r2Object.customMetadata?.[digestHeaderInReference];
+  if (!digest) {
+    throw new InternalError();
+  }
+  return digest;
+}
+
+// A blob's bytes as the client asked for them: the whole object, or the
+// range R2 answered.
+function layerResponse(res: R2ObjectBody, digest: string, rangeHeader?: string): GetLayerResponse {
+  if (rangeHeader !== undefined && res.range !== undefined) {
+    const offset =
+      "offset" in res.range && res.range.offset !== undefined
+        ? res.range.offset
+        : "suffix" in res.range && res.range.suffix !== undefined
+          ? res.size - res.range.suffix
+          : 0;
+    const length = "length" in res.range && res.range.length !== undefined ? res.range.length : res.size - offset;
+    return {
+      stream: res.body!,
+      digest,
+      size: length,
+      range: { offset, length },
+      totalSize: res.size,
+    };
+  }
+
+  return {
+    stream: res.body!,
+    digest,
+    size: res.size,
+  };
+}
 
 export const ociImageIndexContentType = "application/vnd.oci.image.index.v1+json";
 
@@ -161,6 +257,7 @@ export type State = {
   registryUploadId: string;
   byteRange: number;
   name: string;
+  hashState?: string;
 };
 
 export function getRegistryUploadsPath(state: { registryUploadId: string; name: string }): string {
@@ -665,7 +762,9 @@ export class R2Registry implements Registry {
       }
 
       return {
-        digest: hexToDigest(res.checksums.sha256!),
+        // The source's digest: a reference's is the one verified at its
+        // upload, a plain object's is R2's checksum.
+        digest: isReference(res) ? referencedDigest(res) : hexToDigest(res.checksums.sha256!),
         location: `/v2/${destinationLayerPath}`,
       };
     }
@@ -680,6 +779,22 @@ export class R2Registry implements Registry {
     if (!res) {
       return {
         exists: false,
+      };
+    }
+
+    const key = isReference(res);
+    if (key) {
+      const [underlying, err2] = await wrap(this.env.REGISTRY.head(key));
+      if (err2) {
+        return wrapError("layerExists", err2);
+      }
+      if (!underlying) {
+        return { exists: false };
+      }
+      return {
+        digest: referencedDigest(res),
+        size: underlying.size,
+        exists: true,
       };
     }
 
@@ -703,6 +818,25 @@ export class R2Registry implements Registry {
       return {
         response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
       };
+    }
+
+    // A reference: the bytes are the underlying object's, read whole or at
+    // the range asked for, under the digest verified at upload.
+    const referenced = isReference(res);
+    if (referenced) {
+      res.body?.cancel().catch(() => {});
+      const digestOfReference = referencedDigest(res);
+      const [underlying, err2] = await wrap(this.env.REGISTRY.get(referenced, options));
+      if (err2) {
+        return wrapError("getLayer", err2);
+      }
+      if (!underlying) {
+        // Not a 500: garbage collection deletes the underlying object first.
+        return {
+          response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
+        };
+      }
+      return layerResponse(underlying, digestOfReference, rangeHeader);
     }
 
     // Handle R2 symlink
@@ -739,36 +873,16 @@ export class R2Registry implements Registry {
     // header (some R2 implementations populate res.range on full reads
     // too); res.size is always the FULL object size, which is what
     // Content-Range's total needs.
-    if (rangeHeader !== undefined && res.range !== undefined) {
-      const offset =
-        "offset" in res.range && res.range.offset !== undefined
-          ? res.range.offset
-          : "suffix" in res.range && res.range.suffix !== undefined
-            ? res.size - res.range.suffix
-            : 0;
-      const length =
-        "length" in res.range && res.range.length !== undefined ? res.range.length : res.size - offset;
-      return {
-        stream: res.body!,
-        digest: hexToDigest(res.checksums.sha256!),
-        size: length,
-        range: { offset, length },
-        totalSize: res.size,
-      };
-    }
-
-    return {
-      stream: res.body!,
-      digest: hexToDigest(res.checksums.sha256!),
-      size: res.size,
-    };
+    return layerResponse(res, hexToDigest(res.checksums.sha256!), rangeHeader);
   }
 
   async startUpload(namespace: string): Promise<RegistryError | UploadObject> {
     // Generate a unique ID for this upload
     const uuid = crypto.randomUUID();
 
-    const upload = await this.env.REGISTRY.createMultipartUpload(uuid);
+    const upload = await this.env.REGISTRY.createMultipartUpload(uuid, {
+      customMetadata: { [registryUploadKey]: "true" },
+    });
     const state = {
       uploadId: upload.uploadId,
       parts: [],
@@ -975,12 +1089,41 @@ export class R2Registry implements Registry {
       };
     }
 
-    const res = await appendStreamKnownLength(stream, length);
+    // The chunk is hashed as it is stored, from the first chunk on, as long
+    // as every chunk fits one part. A chunk the parts path splits is not
+    // hashed, and the upload falls back to the copy at its end.
+    let hasherPromise: Promise<IHasher> | undefined;
+    if (length <= MAXIMUM_CHUNK && (state.parts.length === 0 || state.hashState !== undefined)) {
+      const [s1, s2] = stream.tee();
+      stream = s1;
+      const bytes = state.hashState !== undefined ? hashStateFromBase64(state.hashState) : undefined;
+      hasherPromise = hash(s2, bytes);
+    } else {
+      state.hashState = undefined;
+    }
+
+    const [res, hasherResponse] = await Promise.allSettled([appendStreamKnownLength(stream, length), hasherPromise]);
     state.byteRange += length;
-    if (res instanceof RangeError)
+    if (res.status === "rejected") {
+      console.error("Uploading a chunk:", errorString(res.reason));
       return {
-        response: res,
+        response: new InternalError(),
       };
+    }
+
+    if (res.value instanceof RangeError) {
+      return {
+        response: res.value,
+      };
+    }
+
+    if (hasherPromise !== undefined && hasherResponse.status === "rejected") {
+      throw hasherResponse.reason;
+    }
+
+    if (hasherPromise !== undefined && hasherResponse.status === "fulfilled" && hasherResponse.value !== undefined) {
+      state.hashState = hashStateToBase64(hasherResponse.value.save());
+    }
 
     const hashedJwtState = await encodeState(state, env);
     return {
@@ -1037,15 +1180,60 @@ export class R2Registry implements Registry {
       });
     } else {
       const upload = this.env.REGISTRY.resumeMultipartUpload(uuid, state.uploadId);
-      // TODO: Handle one last buffer here
       await upload.complete(state.parts);
-      const obj = await this.env.REGISTRY.get(uuid);
-      const put = this.env.REGISTRY.put(`${namespace}/blobs/${expectedSha}`, obj!.body, {
-        sha256: (expectedSha as string).slice(SHA256_PREFIX_LEN),
-      });
+      const target = `${namespace}/blobs/${expectedSha}`;
+      if (state.hashState !== undefined) {
+        // The digest was computed as the chunks arrived: compare, then
+        // reference the uploaded object from the blob's path.
+        const hasher = await hash(null, hashStateFromBase64(state.hashState));
+        const digest = "sha256:" + hasher.digest("hex");
+        if (digest !== expectedSha) {
+          await this.env.REGISTRY.delete(uuid);
+          await this.env.REGISTRY.delete(getRegistryUploadsPath(state));
+          return {
+            response: new RegistryResponseJSON(JSON.stringify(DigestInvalid(expectedSha, digest)), { status: 400 }),
+          };
+        }
 
-      await put;
-      await this.env.REGISTRY.delete(uuid);
+        const [, err] = await wrap(
+          this.env.REGISTRY.put(target, uuid, {
+            customMetadata: {
+              [referenceHeader]: uuid,
+              [digestHeaderInReference]: digest,
+            },
+          }),
+        );
+        if (err !== null) {
+          console.error("Writing the blob's reference:", errorString(err));
+          await this.env.REGISTRY.delete(uuid);
+          return {
+            response: new InternalError(),
+          };
+        }
+      } else {
+        // No hash state: the bytes are copied to the blob's path in one
+        // request, which R2 verifies against the digest and bounds at its
+        // single-request upload size.
+        const obj = await this.env.REGISTRY.get(uuid);
+        if (obj === null) {
+          console.error("The upload's object is missing right after its completion");
+          return {
+            response: new InternalError(),
+          };
+        }
+        const [, err] = await wrap(
+          this.env.REGISTRY.put(target, obj.body, {
+            sha256: (expectedSha as string).slice(SHA256_PREFIX_LEN),
+          }),
+        );
+        await this.env.REGISTRY.delete(uuid);
+        if (err !== null) {
+          console.error("Copying the blob to its path:", errorString(err));
+          return {
+            response: new InternalError(),
+          };
+        }
+      }
     }
 
     await this.env.REGISTRY.delete(getRegistryUploadsPath(state));

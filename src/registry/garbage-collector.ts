@@ -4,6 +4,7 @@
 // that are not referenced by the remaining manifests.
 
 import { ManifestSchema } from "../manifest";
+import { isReference } from "./r2";
 import { hexToDigest } from "../user";
 import { symlinkHeader } from "./r2";
 
@@ -346,11 +347,18 @@ export class GarbageCollector {
     }
 
     const unreferencedBlobs = new Set<string>();
+    // A blob stored as a reference keeps its bytes in the object it names:
+    // that object goes with the blob, unless a symlink keeps the blob.
+    const underlyingOf = new Map<string, string>();
     // List blobs to be removed
     await this.list(`${options.name}/blobs/`, async (object) => {
       const blobHash = object.key.split("/").pop();
       if (blobHash && !referencedBlobs.has(blobHash)) {
         unreferencedBlobs.add(object.key);
+        const underlying = isReference(object);
+        if (underlying) {
+          underlyingOf.set(object.key, underlying);
+        }
       }
       return true;
     });
@@ -386,8 +394,13 @@ export class GarbageCollector {
         throw new Error("there is a manifest insertion going, the garbage collection shall stop");
       }
 
-      // GC will delete unreferenced blobs
-      await this.registry.delete(unreferencedBlobs.values().toArray());
+      // GC will delete unreferenced blobs, and the objects their references name
+      const keys = unreferencedBlobs.values().toArray();
+      for (const key of keys) {
+        const underlying = underlyingOf.get(key);
+        if (underlying !== undefined) keys.push(underlying);
+      }
+      await this.registry.delete(keys);
     }
 
     return true;

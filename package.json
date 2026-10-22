@@ -16,6 +16,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@taylorzane/hash-wasm": "0.0.11",
     "@tsndr/cloudflare-worker-jwt": "^3.2.3",
     "itty-router": "^5.0.24",
     "rfc4648": "^1.5.4",
