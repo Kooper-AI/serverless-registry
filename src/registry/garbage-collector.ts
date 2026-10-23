@@ -38,11 +38,19 @@ export type GCOptions = {
 //
 // This makes it so: after every layer is OK we can proceed and insert the manifest, as there is no ongoing GC
 // In the GC code, if there is an insertion on-going, there is an error.
+// Seconds an unreferenced blob is kept after its upload, unless configured
+// otherwise: a push writes its blobs first and its manifest last, so a blob
+// no manifest names yet may be a push in flight. Two hours, as Harbor's
+// collector reserves recently uploaded layers.
+export const DEFAULT_RECENT_WINDOW_SECONDS = 7200;
+
 export class GarbageCollector {
   private registry: R2Bucket;
+  private recentWindowMs: number;
 
-  constructor(registry: R2Bucket) {
+  constructor(registry: R2Bucket, recentWindowSeconds: number = DEFAULT_RECENT_WINDOW_SECONDS) {
     this.registry = registry;
+    this.recentWindowMs = recentWindowSeconds * 1000;
   }
 
   async markForGarbageCollection(namespace: string): Promise<string> {
@@ -353,6 +361,10 @@ export class GarbageCollector {
     // List blobs to be removed
     await this.list(`${options.name}/blobs/`, async (object) => {
       const blobHash = object.key.split("/").pop();
+      // A blob uploaded within the window may belong to a push in flight.
+      if (object.uploaded.getTime() + this.recentWindowMs > Date.now()) {
+        return true;
+      }
       if (blobHash && !referencedBlobs.has(blobHash)) {
         unreferencedBlobs.add(object.key);
         const underlying = isReference(object);

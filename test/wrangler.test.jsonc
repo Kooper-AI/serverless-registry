@@ -17,6 +17,8 @@
       "vars": {
         "USERNAME": "hello",
         "PASSWORD": "world",
+        // The suite collects at once; the window has a test of its own.
+        "GC_RECENT_WINDOW_SECONDS": "0",
       },
     },
   },

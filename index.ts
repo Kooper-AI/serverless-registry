@@ -22,6 +22,9 @@ export interface Env {
   READONLY_USERNAME?: string;
   READONLY_PASSWORD?: string;
   PUSH_COMPATIBILITY_MODE?: PushCompatibilityMode;
+  // Seconds an unreferenced blob is kept after its upload: a push in flight
+  // writes its blobs before its manifest (default 7200, two hours).
+  GC_RECENT_WINDOW_SECONDS?: string;
   REGISTRIES_JSON?: string; // should be in the format of RegistryConfiguration[];
   REGISTRY_CLIENT: Registry;
 }

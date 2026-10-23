@@ -9,6 +9,7 @@ import type { ReferrerDescriptor } from "../src/registry/registry";
 import { isDockerDotIO, RegistryHTTPClient } from "../src/registry/http";
 import { ManifestSchema } from "../src/manifest";
 import { limit, MINIMUM_CHUNK } from "../src/chunk";
+import { DEFAULT_RECENT_WINDOW_SECONDS, GarbageCollector } from "../src/registry/garbage-collector";
 import { digestHeaderInReference, referenceHeader } from "../src/registry/r2";
 import worker from "../index";
 import { env } from "cloudflare:workers";
@@ -475,6 +476,28 @@ describe("blobs pushed in chunks", () => {
     expect((await bindings.REGISTRY.list({ prefix: `${name}/uploads/` })).objects.length).toBe(0);
     const head = await fetch(createRequest("HEAD", `/v2/${name}/blobs/${claimed}`, null));
     expect(head.status).toBe(404);
+  });
+
+  test("an unreferenced blob uploaded within the window is kept: it may be a push in flight", async () => {
+    const name = "chunked-recent";
+    const chunks = [randomChunk(chunkBytes), randomChunk(chunkBytes)];
+    const digest = await digestOf(chunks);
+    const location = await pushChunks(name, chunks);
+    const put = await fetch(createRequest("PUT", location + "&digest=" + digest, null, {}));
+    expect(put.status).toBe(201);
+    const bindings = env as Env;
+    const underlyingKey = (await bindings.REGISTRY.head(`${name}/blobs/${digest}`))!.customMetadata![referenceHeader];
+
+    // A collector with the window every deployment has by default.
+    const collector = new GarbageCollector(bindings.REGISTRY, DEFAULT_RECENT_WINDOW_SECONDS);
+    expect(await collector.collect({ name, mode: "unreferenced" })).toBe(true);
+    expect(await bindings.REGISTRY.head(`${name}/blobs/${digest}`)).not.toBeNull();
+    expect(await bindings.REGISTRY.head(underlyingKey)).not.toBeNull();
+
+    // Past the window (the suite's environment collects at once), it goes.
+    expect(await new GarbageCollector(bindings.REGISTRY, 0).collect({ name, mode: "unreferenced" })).toBe(true);
+    expect(await bindings.REGISTRY.head(`${name}/blobs/${digest}`)).toBeNull();
+    expect(await bindings.REGISTRY.head(underlyingKey)).toBeNull();
   });
 
   test("garbage collection of an unreferenced blob removes the object its reference names", async () => {

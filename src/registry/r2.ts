@@ -326,7 +326,11 @@ export class R2Registry implements Registry {
   private gc: GarbageCollector;
 
   constructor(private env: Env) {
-    this.gc = new GarbageCollector(this.env.REGISTRY);
+    const window = this.env.GC_RECENT_WINDOW_SECONDS;
+    this.gc =
+      window === undefined
+        ? new GarbageCollector(this.env.REGISTRY)
+        : new GarbageCollector(this.env.REGISTRY, Number(window));
   }
 
   async manifestExists(name: string, reference: string): Promise<RegistryError | CheckManifestResponse> {
