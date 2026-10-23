@@ -433,6 +433,17 @@ describe("blobs pushed in chunks", () => {
     expect(ranged.status).toBe(206);
     expect(ranged.headers.get("Content-Range")).toBe(`bytes ${chunkBytes}-${chunkBytes + 15}/${chunkBytes * 3 - 7}`);
     expect(new Uint8Array(await ranged.arrayBuffer())).toEqual(chunks[1].subarray(0, 16));
+
+    // The resume shape docker sends after a dropped pull, at an offset far
+    // past the reference object's own length: the range is the bytes',
+    // never the pointer's.
+    const resumeAt = chunkBytes * 2 + 11;
+    const resumed = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { Range: `bytes=${resumeAt}-` }));
+    expect(resumed.status).toBe(206);
+    expect(resumed.headers.get("Content-Range")).toBe(`bytes ${resumeAt}-${chunkBytes * 3 - 8}/${chunkBytes * 3 - 7}`);
+    const rest = new Uint8Array(await resumed.arrayBuffer());
+    expect(rest.length).toBe(chunkBytes - 7 - 11);
+    expect(rest.subarray(0, 32)).toEqual(chunks[2].subarray(11, 43));
   });
 
   test("hashing a 45 MB chunk as it is stored costs well under a Worker's CPU limit", async () => {

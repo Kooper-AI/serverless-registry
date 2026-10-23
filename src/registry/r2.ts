@@ -810,10 +810,56 @@ export class R2Registry implements Registry {
   }
 
   async getLayer(name: string, digest: string, rangeHeader?: string): Promise<RegistryError | GetLayerResponse> {
+    const key = `${name}/blobs/${digest}`;
     // R2 natively supports ranged reads when handed the raw Range header.
     const options: R2GetOptions | undefined =
       rangeHeader !== undefined ? { range: new Headers({ range: rangeHeader }) } : undefined;
-    const [res, err] = await wrap(this.env.REGISTRY.get(`${name}/blobs/${digest}`, options));
+
+    // A reference or a symlink is a small object standing for bytes held
+    // elsewhere, and a Range is meant for those bytes: read through the
+    // small object it is a slice of the pointer, or, past its end, an R2
+    // error (10039, "The requested range is not satisfiable") rather than a
+    // 206. So a ranged read resolves the object by its metadata first and
+    // reads the range from the object that holds the bytes.
+    if (rangeHeader !== undefined) {
+      const [meta, errMeta] = await wrap(this.env.REGISTRY.head(key));
+      if (errMeta) {
+        return wrapError("getLayer", errMeta);
+      }
+      if (!meta) {
+        return {
+          response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
+        };
+      }
+      const referenced = isReference(meta);
+      if (referenced) {
+        const [underlying, err2] = await wrap(this.env.REGISTRY.get(referenced, options));
+        if (err2) {
+          return wrapError("getLayer", err2);
+        }
+        if (!underlying) {
+          // Not a 500: garbage collection deletes the underlying object first.
+          return {
+            response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
+          };
+        }
+        return layerResponse(underlying, referencedDigest(meta), rangeHeader);
+      }
+      if (meta.customMetadata && symlinkHeader in meta.customMetadata) {
+        const [link, err3] = await wrap(this.env.REGISTRY.get(key));
+        if (err3) {
+          return wrapError("getLayer", err3);
+        }
+        if (!link) {
+          return {
+            response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
+          };
+        }
+        return await this.followSymlink(name, digest, await link.text(), rangeHeader);
+      }
+    }
+
+    const [res, err] = await wrap(this.env.REGISTRY.get(key, options));
     if (err) {
       return wrapError("getLayer", err);
     }
@@ -824,13 +870,13 @@ export class R2Registry implements Registry {
       };
     }
 
-    // A reference: the bytes are the underlying object's, read whole or at
-    // the range asked for, under the digest verified at upload.
+    // A reference: the bytes are the underlying object's, read whole, under
+    // the digest verified at upload.
     const referenced = isReference(res);
     if (referenced) {
       res.body?.cancel().catch(() => {});
       const digestOfReference = referencedDigest(res);
-      const [underlying, err2] = await wrap(this.env.REGISTRY.get(referenced, options));
+      const [underlying, err2] = await wrap(this.env.REGISTRY.get(referenced));
       if (err2) {
         return wrapError("getLayer", err2);
       }
@@ -840,37 +886,12 @@ export class R2Registry implements Registry {
           response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
         };
       }
-      return layerResponse(underlying, digestOfReference, rangeHeader);
+      return layerResponse(underlying, digestOfReference, undefined);
     }
 
-    // Handle R2 symlink
+    // Handle R2 symlink: a tiny path string naming the layer to serve.
     if (res.customMetadata && symlinkHeader in res.customMetadata) {
-      // Symlink objects are tiny path strings — a ranged read would slice
-      // the link text itself, so re-read the whole link object before
-      // resolving, then apply the range to the TARGET layer.
-      let linkObject: R2ObjectBody = res;
-      if (rangeHeader !== undefined) {
-        res.body?.cancel().catch(() => {});
-        const [full, err2] = await wrap(this.env.REGISTRY.get(`${name}/blobs/${digest}`));
-        if (err2) {
-          return wrapError("getLayer", err2);
-        }
-        if (!full) {
-          return {
-            response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
-          };
-        }
-        linkObject = full;
-      }
-      const layerPath = await linkObject.text();
-      // Symlink detected! Will download layer from "layerPath"
-      const [linkName, linkDigest] = layerPath.split("/blobs/");
-      if (linkName == name && linkDigest == digest) {
-        return {
-          response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
-        };
-      }
-      return await this.env.REGISTRY_CLIENT.getLayer(linkName, linkDigest, rangeHeader);
+      return await this.followSymlink(name, digest, await res.text(), rangeHeader);
     }
 
     // Only report a partial read when the caller actually sent a Range
@@ -878,6 +899,23 @@ export class R2Registry implements Registry {
     // too); res.size is always the FULL object size, which is what
     // Content-Range's total needs.
     return layerResponse(res, hexToDigest(res.checksums.sha256!), rangeHeader);
+  }
+
+  // The layer a symlink names, whole or at the range asked for; a link to
+  // itself is no layer.
+  private async followSymlink(
+    name: string,
+    digest: string,
+    layerPath: string,
+    rangeHeader?: string,
+  ): Promise<RegistryError | GetLayerResponse> {
+    const [linkName, linkDigest] = layerPath.split("/blobs/");
+    if (linkName == name && linkDigest == digest) {
+      return {
+        response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
+      };
+    }
+    return await this.env.REGISTRY_CLIENT.getLayer(linkName, linkDigest, rangeHeader);
   }
 
   async startUpload(namespace: string): Promise<RegistryError | UploadObject> {
